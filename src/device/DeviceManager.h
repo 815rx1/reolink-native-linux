@@ -11,6 +11,8 @@
 #include <QDateTime>
 #include <QFutureSynchronizer>
 #include <QHash>
+
+#include <atomic>
 #include <QSet>
 #include <QSize>
 #include <QTimer>
@@ -104,12 +106,25 @@ public:
     // Any embedded credentials are stripped to the keyring, not persisted in the DB.
     Q_INVOKABLE void addStreamUrl(const QString &name, const QString &url);
     Q_INVOKABLE void removeDevice(int row);
+    // Sidebar drag & drop: move the device at fromRow (its whole host — an NVR
+    // moves with all its cameras) to where toRow's host is. The order is saved
+    // and restored on the next start. Emits a model reset; views re-resolve
+    // their cameras by host id + channel.
+    Q_INVOKABLE void moveDevice(int fromRow, int toRow);
 
     // Playable URL for a device row; empty when credentials aren't loaded yet.
     Q_INVOKABLE QString liveUrl(int row, bool mainStream = true);
     // True for a device added without HTTP(S) (only the Baichuan port answers):
     // live view must use startBaichuanLive for the sub stream too.
     Q_INVOKABLE bool baichuanOnly(int row) const;
+    // Recorded playback for this row goes over Baichuan (standalone cameras):
+    // playbackUrl() is empty, the UI uses startBaichuanPlayback for SD and HD.
+    Q_INVOKABLE bool bcPlayback(int row) const;
+    // Preview image per clip (Baichuan 298 CoverPreview), fetched over ONE
+    // connection in the background; each arrives via clipThumbReady with a
+    // file:// URL (cached on disk, so a second visit is instant). epochs is a
+    // list of [startEpoch, endEpoch] pairs.
+    Q_INVOKABLE void requestClipThumbs(int row, const QVariantList &epochs);
 
     // GetEnc-declared display size for a channel's main/sub stream (e.g. main
     // 7680x2160). Lets StreamPlayer detect a transmitted-rotated stream by
@@ -252,6 +267,7 @@ signals:
     void recordingsFound(int row, const QVariantList &segments);
     void recordingDaysFound(int row, int year, int month, const QVariantList &days);
     void recordingsFailed(int row, const QString &error);
+    void clipThumbReady(int row, double startEpoch, const QString &url);
     void hdClipReady(int row, const QString &localPath, qint64 startEpoch);
     void hdClipFailed(int row, const QString &error);
     void clipExported(int row, const QString &path);
@@ -360,6 +376,10 @@ private:
     std::shared_ptr<ReolinkHttpClient> clientFor(int row);
     // Pan/tilt over Baichuan (cmd 18) for devices without HTTP; see the .cpp.
     void bcPtz(int row, const QString &command, int speed);
+    void searchRecordingsBc(int row, const QDate &date);
+    // Generation of requestClipThumbs: a newer request (other day/camera)
+    // makes the running fetch stop. The playback page shows one camera at a time.
+    std::atomic_int m_thumbGen{0};
 
     Database *m_db;
     CredentialStore *m_credentials;

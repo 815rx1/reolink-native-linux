@@ -2,10 +2,16 @@
 
 #include "core/Log.h"
 #include "core/Paths.h"
+#include "media/BcMediaParser.h"
 #include "media/StreamPlayer.h"
 #include "protocol/BaichuanClient.h"
 #include "protocol/BaichuanControl.h"
 #include "protocol/ReolinkHttpClient.h"
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
+}
 
 #include <QDateTime>
 #include <QDir>
@@ -20,7 +26,9 @@
 #include <QThread>
 #include <QThreadPool>
 
+#include <algorithm>
 #include <map>
+#include <tuple>
 #include <memory>
 #include <QtConcurrent/QtConcurrent>
 
@@ -84,6 +92,57 @@ void bcDeviceInfo(BaichuanControl &bc, const QString &addr, QString *name, QStri
         *model = QStringLiteral("Reolink");
 }
 
+// ---- Baichuan recordings (search 14/15/16, day list 142) -------------------
+// Message layout as verified against real cameras by the Reolink-Lokal mobile
+// app (PROTOCOL.md there): the channel goes in the body, header channel 0.
+QByteArray bcBody(const QByteArray &inner)
+{
+    return QByteArrayLiteral("<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n") + inner
+           + QByteArrayLiteral("\n</body>\n");
+}
+QByteArray bcTimeXml(const char *tag, const QDateTime &t)
+{
+    const QDate d = t.date();
+    const QTime h = t.time();
+    return QByteArray("<") + tag + ">\n<year>" + QByteArray::number(d.year()) + "</year>\n<month>"
+           + QByteArray::number(d.month()) + "</month>\n<day>" + QByteArray::number(d.day())
+           + "</day>\n<hour>" + QByteArray::number(h.hour()) + "</hour>\n<minute>"
+           + QByteArray::number(h.minute()) + "</minute>\n<second>" + QByteArray::number(h.second())
+           + "</second>\n</" + tag + ">";
+}
+// Inner XML of every <tag>…</tag> (tags may carry attributes).
+QList<QByteArray> bcBlocks(const QByteArray &xml, const char *tag)
+{
+    QList<QByteArray> out;
+    const QByteArray open = QByteArray("<") + tag;
+    const QByteArray close = QByteArray("</") + tag + ">";
+    int pos = 0;
+    while ((pos = xml.indexOf(open, pos)) >= 0) {
+        const char next = pos + open.size() < xml.size() ? xml[pos + open.size()] : '\0';
+        if (next != '>' && next != ' ') { pos += open.size(); continue; }
+        const int gt = xml.indexOf('>', pos);
+        const int end = xml.indexOf(close, gt);
+        if (gt < 0 || end < 0)
+            break;
+        out.append(xml.mid(gt + 1, end - gt - 1));
+        pos = end + close.size();
+    }
+    return out;
+}
+QDateTime bcParseTime(const QByteArray &xml, const char *tag)
+{
+    const QList<QByteArray> b = bcBlocks(xml, tag);
+    if (b.isEmpty())
+        return {};
+    auto f = [&](const char *n) { return bcTag(b.first(), n).toInt(); };
+    const QDate d(f("year"), f("month"), f("day"));
+    const QTime t(f("hour"), f("minute"), f("second"));
+    return d.isValid() && t.isValid() ? QDateTime(d, t) : QDateTime();
+}
+const char *const kBcRecordTypes[] = {
+    "manual", "sched", "io", "md", "people", "face", "vehicle", "dog_cat", "visitor", "other",
+    "package", "crossline", "intrusion", "loitering", "legacy", "loss", "answer", "nonmotorveh"};
+
 // Firmware spells the codec several ways ("h265", "H265", "hevc") and newer
 // builds sometimes omit the field entirely. Empty result = unknown, and an
 // unknown codec is PROBED from the stream rather than assumed — assuming h264
@@ -126,7 +185,19 @@ QSize encStreamSize(const Json &enc, const char *stream)
 DeviceManager::DeviceManager(Database *db, CredentialStore *credentials, QObject *parent)
     : QAbstractListModel(parent), m_db(db), m_credentials(credentials)
 {
-    const QVector<HostRecord> stored = m_db->hosts();
+    QVector<HostRecord> stored = m_db->hosts();
+    // User order from sidebar drag & drop; hosts not in it keep their id order
+    // after the ordered ones.
+    {
+        const QStringList order = QSettings().value(QStringLiteral("devices/order")).toStringList();
+        auto rank = [&](qint64 id) {
+            const int i = order.indexOf(QString::number(id));
+            return i < 0 ? order.size() : i;
+        };
+        std::stable_sort(stored.begin(), stored.end(), [&](const HostRecord &a, const HostRecord &b) {
+            return rank(a.id) < rank(b.id);
+        });
+    }
     m_entries.reserve(stored.size());
     for (const HostRecord &rec : stored) {
         Entry e;
@@ -1181,8 +1252,247 @@ void DeviceManager::captureEventThumbnail(qint64 hostId, int channel, qint64 eve
     }));
 }
 
+// Standalone cameras (SD card) are searched and played over Baichuan — the
+// path the official and Reolink-Lokal apps use, and the only one for cameras
+// with HTTP off. NVRs keep the HTTP search + FLV path they were built around.
+bool DeviceManager::bcPlayback(int row) const
+{
+    if (row < 0 || row >= m_entries.size())
+        return false;
+    const Entry &e = m_entries.at(row);
+    return e.rec.kind == QLatin1String("camera");
+}
+
+void DeviceManager::searchRecordingsBc(int row, const QDate &date)
+{
+    const Entry &e = m_entries.at(row);
+    const BaichuanControl::Params p{e.rec.addr, e.bcPort, e.rec.username, e.password};
+    const int ch = e.channel;
+    m_pending.addFuture(QtConcurrent::run([this, p, ch, row, date] {
+        QVariantList segments, days;
+        QVector<std::pair<qint64, qint64>> files;
+        QString error;
+        BaichuanControl bc(p);
+        if (!bc.open()) {
+            error = bc.lastFail() == BaichuanControl::Fail::Auth ? tr("wrong username or password")
+                                                                 : tr("couldn't reach the device");
+        } else {
+            const QByteArray chs = QByteArray::number(ch);
+            // Days of the month with recordings (142); index is 0-based.
+            const QDate first(date.year(), date.month(), 1);
+            const QByteArray dayReq = bcBody(
+                "<DayRecords version=\"1.1\">\n"
+                + bcTimeXml("startTime", first.startOfDay()) + "\n"
+                + bcTimeXml("endTime", QDateTime(first.addMonths(1).addDays(-1), QTime(23, 59, 59)))
+                + "\n<DayRecordList>\n<DayRecord>\n<index>0</index>\n<channelId>" + chs
+                + "</channelId>\n</DayRecord>\n</DayRecordList>\n</DayRecords>");
+            const QByteArray dayXml = bc.request(142, dayReq);
+            for (const QByteArray &dt : bcBlocks(dayXml, "dayType")) {
+                const int idx = bcTag(dt, "index").toInt(nullptr);
+                if (!bcTag(dt, "index").isEmpty())
+                    days.append(idx + 1);
+            }
+
+            // Recordings of the day: open (14) -> pages (15) -> close (16).
+            QByteArray types, typeList;
+            for (int i = 0; i < 18; ++i) {
+                if (i < 16)
+                    types += QByteArray(kBcRecordTypes[i]) + ", ";
+                typeList += QByteArray("<i>") + kBcRecordTypes[i] + "</i>\n";
+            }
+            const QByteArray openReq = bcBody(
+                "<FileInfoList version=\"1.1\">\n<FileInfo>\n<searchAITrack>0</searchAITrack>\n"
+                "<channelId>" + chs + "</channelId>\n<streamType>subStream</streamType>\n"
+                "<recordType>" + types + "</recordType>\n<fileRecordType>\n" + typeList
+                + "</fileRecordType>\n" + bcTimeXml("startTime", date.startOfDay()) + "\n"
+                + bcTimeXml("endTime", QDateTime(date, QTime(23, 59, 59)))
+                + "\n</FileInfo>\n</FileInfoList>");
+            quint16 st = 0;
+            const QByteArray openXml = bc.request(14, openReq, &st);
+            const QString handle = bcTag(openXml, "handle");
+            if (handle.isEmpty()) {
+                // No handle: no recordings (or no SD card) — an empty day, not an error.
+                qCInfo(lcProto) << "recordings search: no handle, status" << st;
+            } else {
+                const QByteArray handleReq = bcBody(
+                    "<FileInfoList version=\"1.1\">\n<FileInfo>\n<channelId>" + chs
+                    + "</channelId>\n<searchAITrack>0</searchAITrack>\n<handle>"
+                    + handle.toUtf8() + "</handle>\n</FileInfo>\n</FileInfoList>");
+                QSet<QString> seen;
+                QList<std::tuple<QDateTime, QDateTime, QString>> found;
+                for (int page = 0; page < 200; ++page) {
+                    quint16 pst = 0;
+                    const QByteArray x = bc.request(15, handleReq, &pst);
+                    if (pst != 200)
+                        break;
+                    int added = 0;
+                    for (const QByteArray &fi : bcBlocks(x, "FileInfo")) {
+                        const QString name = bcTag(fi, "name");
+                        const QDateTime s = bcParseTime(fi, "startTime");
+                        const QDateTime en = bcParseTime(fi, "endTime");
+                        if (name.isEmpty() || !s.isValid() || seen.contains(name))
+                            continue;
+                        seen.insert(name);
+                        found.append({s, en.isValid() ? en : s.addSecs(60), bcTag(fi, "recordType")});
+                        ++added;
+                    }
+                    if (added == 0)
+                        break;
+                }
+                bc.request(16, handleReq);
+                std::sort(found.begin(), found.end(),
+                          [](const auto &a, const auto &b) { return std::get<0>(a) < std::get<0>(b); });
+                for (const auto &[fs, fe, rtype] : found) {
+                    const qint64 s0 = qBound(qint64(0), date.startOfDay().secsTo(fs), qint64(86400));
+                    const qint64 e0 = qBound(s0, date.startOfDay().secsTo(fe), qint64(86400));
+                    // Anything but a plain timer/manual recording is an event.
+                    QStringList kinds;
+                    for (const QString &k : rtype.split(u',', Qt::SkipEmptyParts))
+                        kinds << k.trimmed();
+                    const bool event = std::any_of(kinds.begin(), kinds.end(), [](const QString &k) {
+                        return k != QLatin1String("sched") && k != QLatin1String("manual")
+                               && !k.isEmpty();
+                    });
+                    QVariantMap seg;
+                    seg["start"] = static_cast<double>(s0);
+                    seg["end"] = static_cast<double>(e0);
+                    seg["type"] = event ? QStringLiteral("alarm") : QStringLiteral("timer");
+                    seg["kinds"] = kinds;
+                    seg["startEpoch"] = static_cast<double>(fs.toSecsSinceEpoch());
+                    segments.append(seg);
+                    files.append({fs.toSecsSinceEpoch(), fe.toSecsSinceEpoch()});
+                }
+                qCInfo(lcProto) << "recordings search:" << found.size() << "files," << days.size()
+                                << "days with recordings";
+            }
+        }
+        const int year = date.year(), month = date.month();
+        QMetaObject::invokeMethod(
+            this,
+            [this, row, segments, days, year, month, error, files] {
+                if (row >= 0 && row < m_entries.size())
+                    m_entries[row].recordingFiles = files;
+                if (error.isEmpty()) {
+                    emit recordingsFound(row, segments);
+                    emit recordingDaysFound(row, year, month, days);
+                } else {
+                    emit recordingsFailed(row, error);
+                }
+            },
+            Qt::QueuedConnection);
+    }));
+}
+
+namespace {
+// Decode one Annex-B keyframe into a small preview image.
+QImage decodeKeyframe(const QByteArray &annexB, bool hevc, int maxWidth)
+{
+    const AVCodec *codec = avcodec_find_decoder(hevc ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264);
+    if (!codec || annexB.isEmpty())
+        return {};
+    AVCodecContext *ctx = avcodec_alloc_context3(codec);
+    AVPacket *pkt = av_packet_alloc();
+    AVFrame *frame = av_frame_alloc();
+    QImage out;
+    if (ctx && pkt && frame && avcodec_open2(ctx, codec, nullptr) >= 0) {
+        pkt->data = reinterpret_cast<uint8_t *>(const_cast<char *>(annexB.constData()));
+        pkt->size = static_cast<int>(annexB.size());
+        bool got = avcodec_send_packet(ctx, pkt) >= 0 && avcodec_receive_frame(ctx, frame) >= 0;
+        if (!got) { // some decoders only emit after a flush
+            avcodec_send_packet(ctx, nullptr);
+            got = avcodec_receive_frame(ctx, frame) >= 0;
+        }
+        if (got && frame->width > 0 && frame->height > 0) {
+            const int w = qMin(maxWidth, frame->width);
+            const int h = qMax(1, frame->height * w / frame->width);
+            SwsContext *sws = sws_getContext(frame->width, frame->height,
+                                             static_cast<AVPixelFormat>(frame->format), w, h,
+                                             AV_PIX_FMT_RGB32, SWS_BILINEAR, nullptr, nullptr,
+                                             nullptr);
+            if (sws) {
+                out = QImage(w, h, QImage::Format_RGB32);
+                uint8_t *dst[1] = {out.bits()};
+                int dstStride[1] = {static_cast<int>(out.bytesPerLine())};
+                sws_scale(sws, frame->data, frame->linesize, 0, frame->height, dst, dstStride);
+                sws_freeContext(sws);
+            }
+        }
+    }
+    av_frame_free(&frame);
+    av_packet_free(&pkt);
+    avcodec_free_context(&ctx);
+    return out;
+}
+} // namespace
+
+void DeviceManager::requestClipThumbs(int row, const QVariantList &epochs)
+{
+    if (!bcPlayback(row) || !m_entries.at(row).primed || epochs.isEmpty())
+        return;
+    const Entry &e = m_entries.at(row);
+    const BaichuanControl::Params p{e.rec.addr, e.bcPort, e.rec.username, e.password};
+    const int ch = e.channel;
+    const QString prefix = Paths::thumbnailsDir() + QStringLiteral("/clip-%1-%2-")
+                               .arg(e.rec.id).arg(ch);
+    // One fetch per row at a time: a new day/camera supersedes the old list.
+    const int gen = ++m_thumbGen;
+    m_pending.addFuture(QtConcurrent::run([this, p, ch, row, epochs, prefix, gen] {
+        std::unique_ptr<BaichuanControl> bc;
+        for (const QVariant &v : epochs) {
+            if (m_thumbGen.load() != gen)
+                return; // superseded
+            const QVariantList pair = v.toList();
+            if (pair.size() < 2)
+                continue;
+            const qint64 s = static_cast<qint64>(pair.at(0).toDouble());
+            const qint64 en = static_cast<qint64>(pair.at(1).toDouble());
+            const QString path = prefix + QString::number(s) + QStringLiteral(".jpg");
+            if (!QFile::exists(path)) {
+                if (!bc) {
+                    bc = std::make_unique<BaichuanControl>(p);
+                    if (!bc->open())
+                        return;
+                }
+                const QByteArray req = bcBody(
+                    "<CoverPreview version=\"1.1\">\n<channelId>" + QByteArray::number(ch)
+                    + "</channelId>\n<desc>0</desc>\n<streamType>subStream</streamType>\n"
+                    + bcTimeXml("startTime", QDateTime::fromSecsSinceEpoch(s)) + "\n"
+                    + bcTimeXml("endTime", QDateTime::fromSecsSinceEpoch(en))
+                    + "\n<frameList>\n<frameNo>2</frameNo>\n</frameList>\n</CoverPreview>");
+                BcMediaParser parser;
+                QByteArray key;
+                bool hevc = false;
+                parser.onVideo = [&](const BcMediaParser::VideoFrame &f) {
+                    if (key.isEmpty() && f.keyFrame) {
+                        key = f.annexB;
+                        hevc = f.codec == BcMediaParser::Codec::H265;
+                    }
+                };
+                bc->requestMedia(298, req, 2500, [&](const QByteArray &media) {
+                    parser.append(media);
+                    return key.isEmpty();
+                });
+                // Stopped at the first keyframe: drop the rest of this answer,
+                // or it corrupts the next clip's preview (every other one black).
+                bc->drain(400);
+                const QImage img = decodeKeyframe(key, hevc, 192);
+                if (img.isNull() || !img.save(path, "JPG", 80))
+                    continue;
+            }
+            const QString url = QUrl::fromLocalFile(path).toString();
+            QMetaObject::invokeMethod(
+                this, [this, row, s, url] { emit clipThumbReady(row, static_cast<double>(s), url); },
+                Qt::QueuedConnection);
+        }
+    }));
+}
+
 void DeviceManager::searchRecordings(int row, int year, int month, int day)
 {
+    if (bcPlayback(row) && m_entries.at(row).primed && QDate(year, month, day).isValid()) {
+        searchRecordingsBc(row, QDate(year, month, day));
+        return;
+    }
     auto client = clientFor(row);
     const QDate date(year, month, day);
     if (!client || !date.isValid()) {
@@ -1265,8 +1575,8 @@ QString DeviceManager::playbackUrl(int row, qint64 startEpoch, bool mainStream)
     if (row < 0 || row >= m_entries.size() || startEpoch <= 0)
         return {};
     const Entry &e = m_entries.at(row);
-    if (e.rec.kind == QLatin1String("stream") || !e.primed)
-        return {};
+    if (e.rec.kind == QLatin1String("stream") || !e.primed || bcPlayback(row))
+        return {}; // cameras: the caller plays over Baichuan (startBaichuanPlayback)
     // The FLV endpoint only accepts a start on a recording-file boundary and uses
     // `seek` for the offset into that file — a mid-file start time is rejected. Snap
     // to the file containing startEpoch (or the nearest earlier one for a gap).
@@ -2048,6 +2358,57 @@ QString DeviceManager::liveUrl(int row, bool mainStream)
                                                                  : QStringLiteral("h264");
     return api::rtspUrl(e.rec.addr, e.rec.username, e.password, e.channel, mainStream, codec,
                         e.rtspPort);
+}
+
+void DeviceManager::moveDevice(int fromRow, int toRow)
+{
+    if (fromRow < 0 || toRow < 0 || fromRow >= m_entries.size() || toRow >= m_entries.size())
+        return;
+    const qint64 srcHost = m_entries.at(fromRow).rec.id;
+    const qint64 dstHost = m_entries.at(toRow).rec.id;
+    if (srcHost == dstHost)
+        return;
+    // Current host order.
+    QVector<qint64> hosts;
+    for (const Entry &e : m_entries)
+        if (!hosts.contains(e.rec.id))
+            hosts.append(e.rec.id);
+    const int from = hosts.indexOf(srcHost);
+    const int to = hosts.indexOf(dstHost);
+    hosts.move(from, to); // moving down lands after the target, up before it
+
+    // Row-keyed state must follow its camera, not the index.
+    auto key = [](const Entry &e) { return qMakePair(e.rec.id, e.channel); };
+    QHash<QPair<qint64, int>, int> push;
+    for (auto it = m_pushEnabled.cbegin(); it != m_pushEnabled.cend(); ++it)
+        if (it.key() >= 0 && it.key() < m_entries.size())
+            push.insert(key(m_entries.at(it.key())), it.value());
+    const bool hadPlayback = m_playbackRow >= 0 && m_playbackRow < m_entries.size();
+    const auto playbackKey = hadPlayback ? key(m_entries.at(m_playbackRow)) : qMakePair(qint64(-1), -1);
+
+    beginResetModel();
+    QVector<Entry> sorted;
+    sorted.reserve(m_entries.size());
+    for (qint64 h : hosts)
+        for (const Entry &e : std::as_const(m_entries))
+            if (e.rec.id == h)
+                sorted.append(e);
+    m_entries = sorted;
+    m_pushEnabled.clear();
+    m_playbackRow = -1;
+    for (int r = 0; r < m_entries.size(); ++r) {
+        const auto k = key(m_entries.at(r));
+        if (push.contains(k))
+            m_pushEnabled.insert(r, push.value(k));
+        if (hadPlayback && k == playbackKey)
+            m_playbackRow = r;
+    }
+    endResetModel();
+
+    QStringList order;
+    for (qint64 h : hosts)
+        order << QString::number(h);
+    QSettings().setValue(QStringLiteral("devices/order"), order);
 }
 
 bool DeviceManager::baichuanOnly(int row) const

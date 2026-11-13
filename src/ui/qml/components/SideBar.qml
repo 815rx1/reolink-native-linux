@@ -360,6 +360,27 @@ Rectangle {
                     }
                 }
 
+                // Reorder: another sidebar row dropped here takes this position.
+                DropArea {
+                    anchors.fill: parent
+                    keys: ["reolink/camera"]
+                    readonly property bool fromList: drag.source && drag.source.sourcePane === -1
+                                                     && drag.source.deviceRow !== camRow.index
+                    onDropped: (drop) => {
+                        if (drop.source && drop.source.sourcePane === -1
+                            && drop.source.deviceRow !== camRow.index)
+                            Devices.moveDevice(drop.source.deviceRow, camRow.index);
+                    }
+                    // Insertion line: above when coming from below, else below.
+                    Rectangle {
+                        visible: parent.containsDrag && parent.fromList
+                        width: parent.width; height: 3
+                        color: Theme.accent
+                        y: parent.drag.source && parent.drag.source.deviceRow > camRow.index
+                           ? 0 : parent.height - height
+                    }
+                }
+
                 // Dragged into a Live View cell to put this camera there. Lives in
                 // the window overlay so the list delegate's clip doesn't cut it off.
                 Item {
@@ -407,6 +428,18 @@ Rectangle {
                     property real pressX: 0
                     property real pressY: 0
                     property bool dragging: false
+                    // Press and hold, then move: drag to reorder the list (or onto
+                    // a live tile). A quick sideways drag still starts right away.
+                    pressAndHoldInterval: 350
+                    onPressAndHold: (m) => {
+                        if (dragging || m.button !== Qt.LeftButton)
+                            return;
+                        dragging = true;
+                        var p = mapToItem(camDrag.parent, m.x, m.y);
+                        camDrag.x = p.x - camDrag.width / 2;
+                        camDrag.y = p.y - camDrag.height / 2;
+                        camDrag.Drag.active = true;
+                    }
 
                     // Left-click opens the camera full-size in Live View;
                     // right-click opens its management menu.

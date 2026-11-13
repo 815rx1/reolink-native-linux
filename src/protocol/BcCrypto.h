@@ -30,4 +30,12 @@ QByteArray aesKey(const QString &nonce, const QString &password);
 // control bodies and, under FullAES, the media payload.
 QByteArray aesCfb(const QByteArray &in, const QByteArray &key, bool decrypt);
 
+// The session cipher. Devices negotiate it in the nonce reply: 0xdd12 = AES
+// (key from nonce + password), 0xdd01 = the older XOR-only "BCEncrypt" (e.g.
+// RLC-410S firmware). An EMPTY key means XOR mode: XOR with the message's
+// header channel byte as offset (symmetric, so it both en- and decrypts).
+QByteArray crypt(const QByteArray &in, const QByteArray &aesKey, bool decrypt, quint8 xorOffset);
+// True when the nonce reply's code asks for XOR-only encryption.
+inline bool isXorOnly(quint16 nonceCode) { return (nonceCode & 0xFF) == 0x01; }
+
 } // namespace rl::bc

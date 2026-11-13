@@ -81,7 +81,12 @@ bool parseMessage(QByteArray &buf, Msg &m)
         return false; // caller resyncs
     const quint32 bodyLen = getLE32(buf.constData() + 8);
     const quint16 cls = getLE16(buf.constData() + 18);
-    const bool hasPayloadOffset = (cls == 0x6414 || cls == 0x0000);
+    // Only the legacy classes (0x6514 request / 0x6614 reply) have the short
+    // 20-byte header; EVERY other header is 24 bytes. Recorded-playback data
+    // carries the ReplaySeek seq in the code+class fields, so testing for the
+    // modern class (0x6414/0x0000) misread those headers as 20 bytes and tore
+    // the stream apart — playback never produced a picture.
+    const bool hasPayloadOffset = !(cls == 0x6514 || cls == 0x6614);
     const int headerLen = hasPayloadOffset ? 24 : 20;
     if (buf.size() < headerLen + static_cast<int>(bodyLen))
         return false;
@@ -227,7 +232,8 @@ bool BaichuanClient::connectAndLogin(QTcpSocket &sock, QByteArray &aesKey)
     if (a < 0 || z < 0)
         return false;
     const QString nonce = QString::fromUtf8(nonceXml.mid(a + 7, z - a - 7));
-    aesKey = bc::aesKey(nonce, m_p.password);
+    // XOR-only devices (nonce code 0xdd01): empty key = XOR mode (bc::crypt).
+    aesKey = bc::isXorOnly(nonceMsg.code) ? QByteArray() : bc::aesKey(nonce, m_p.password);
 
     // Step 2: modern login (XOR body — msg_id 1 is always XOR).
     const QByteArray user = bc::modernHash(m_p.username, nonce);
@@ -260,7 +266,7 @@ bool BaichuanClient::startStream(QTcpSocket &sock, const QByteArray &aesKey)
             "<channelId>" + QByteArray::number(m_p.channel) + "</channelId>\n<handle>" +
             QByteArray::number(m_p.mainStream ? 0 : 256) + "</handle>\n<streamType>" +
             streamName.toUtf8() + "</streamType>\n</Preview></body>\n";
-        sock.write(frame(3, m_p.channel, streamByte, 20, 0, 0x6414, bc::aesCfb(preview, aesKey, false)));
+        sock.write(frame(3, m_p.channel, streamByte, 20, 0, 0x6414, bc::crypt(preview, aesKey, false, m_p.channel)));
         sock.flush();
         m_streamTail = netBuf;
         return true;
@@ -294,7 +300,7 @@ void BaichuanClient::sendPlayback(QTcpSocket &sock, const QByteArray &aesKey, qi
         "<streamType>" + streamName + "</streamType>\n"
         + timeXml(QStringLiteral("startTime"), start) + "\n"
         + timeXml(QStringLiteral("endTime"), dayEnd) + "\n</FileInfo>\n</FileInfoList>\n</body>\n";
-    sock.write(frame(143, m_p.channel, streamByte, 20, 0, 0x6414, bc::aesCfb(byTime, aesKey, false)));
+    sock.write(frame(143, m_p.channel, streamByte, 20, 0, 0x6414, bc::crypt(byTime, aesKey, false, m_p.channel)));
     sock.flush();
 }
 
@@ -404,15 +410,17 @@ void BaichuanClient::pumpMedia(QTcpSocket &sock, const QByteArray &aesKey, quint
         // of the payload, the remainder is plaintext.
         int encLen = 0;
         if (m.payloadOffset > 0) {
-            const QByteArray ext = bc::aesCfb(m.body.left(m.payloadOffset), aesKey, true);
-            const int p = ext.indexOf("<encryptLen>");
+            // Firmware spells the tag <encryptLen> or <EncryptLen>.
+            const QByteArray ext =
+                bc::crypt(m.body.left(m.payloadOffset), aesKey, true, m.channel).toLower();
+            const int p = ext.indexOf("<encryptlen>");
             if (p >= 0) {
-                const int q = ext.indexOf("</encryptLen>", p);
+                const int q = ext.indexOf("</encryptlen>", p);
                 encLen = ext.mid(p + 12, q - p - 12).toInt();
             }
         }
         const QByteArray payload = m.body.mid(m.payloadOffset);
-        const QByteArray media = encLen > 0
+        const QByteArray media = encLen > 0 && !aesKey.isEmpty()
             ? bc::aesCfb(payload.left(encLen), aesKey, true) + payload.mid(encLen)
             : payload;
         parser.append(media);

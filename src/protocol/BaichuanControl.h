@@ -5,6 +5,7 @@
 #include <QVariantMap>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 
 class QTcpSocket;
@@ -70,6 +71,24 @@ public:
     // reply. bodyXml empty => header-only GET. Used by the helpers above.
     QByteArray transact(quint32 cmdId, int channel, const QByteArray &bodyXml,
                         quint16 *statusOut = nullptr);
+
+    // Plain request framed like the official/mobile apps: header channel byte 0,
+    // no Extension — the channel goes in the body XML. Used for recordings
+    // search (14/15/16), day list (142) and snapshots.
+    QByteArray request(quint32 cmdId, const QByteArray &bodyXml, quint16 *statusOut = nullptr);
+
+    // Request whose answer is an XML status reply followed by binary media
+    // messages (cover previews 298, snapshots 109, downloads 143). Each binary
+    // payload is handed to onPayload already decrypted (only the first
+    // <encryptLen> bytes are AES); return false from it to stop early. Ends when
+    // the device is quiet for idleMs. Returns the XML reply's status (0 = none).
+    quint16 requestMedia(quint32 cmdId, const QByteArray &bodyXml, int idleMs,
+                         const std::function<bool(const QByteArray &)> &onPayload);
+
+    // Read and discard whatever the device still sends until it has been quiet
+    // for quietMs — after stopping a requestMedia early, so the tail of that
+    // answer can't bleed into the next request.
+    void drain(int quietMs);
 
     bool isOpen() const;
 

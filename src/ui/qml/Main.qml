@@ -172,6 +172,20 @@ ApplicationWindow {
                     onPopOut: (row, lbl) => window.openPopout(row, lbl)
                 }
                 PlaybackPage { id: playbackPage; active: nav.currentIndex === 1 }
+                // Switching Live View -> Playback carries the watched camera over
+                // (the maximized one, else the one last clicked).
+                Connections {
+                    target: nav
+                    property int lastIndex: 0
+                    function onCurrentIndexChanged() {
+                        if (nav.currentIndex === 1 && lastIndex === 0) {
+                            var r = liveViewPage.maximizedIndex >= 0 ? liveViewPage.maximizedIndex
+                                                                     : liveViewPage.selectedIndex;
+                            playbackPage.selectCamera(r);
+                        }
+                        lastIndex = nav.currentIndex;
+                    }
+                }
                 EventsPage {
                     onJumpToPlayback: (hostId, channel, timestamp) => {
                         nav.currentIndex = 1;

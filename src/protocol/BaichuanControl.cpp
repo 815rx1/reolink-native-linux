@@ -93,7 +93,8 @@ bool parseMessage(QByteArray &buf, Msg &m)
         return false;
     const quint32 bodyLen = getLE32(buf.constData() + 8);
     const quint16 cls = getLE16(buf.constData() + 18);
-    const bool modern = (cls == kClassModern || cls == 0x0000);
+    // 20-byte header only for the legacy classes; all others are 24 bytes.
+    const bool modern = !(cls == kClassLegacy || cls == 0x6614);
     const int headerLen = modern ? 24 : 20;
     if (buf.size() < headerLen + static_cast<int>(bodyLen))
         return false;
@@ -207,7 +208,8 @@ bool BaichuanControl::open()
         return false;
     }
     const QString nonce = QString::fromUtf8(nonceXml.mid(a + 7, z - a - 7));
-    m_aesKey = bc::aesKey(nonce, m_p.password);
+    // XOR-only devices: keep the key empty (see bc::crypt).
+    m_aesKey = bc::isXorOnly(nonceMsg.status) ? QByteArray() : bc::aesKey(nonce, m_p.password);
 
     // Step 2: modern login (XOR body, but the modern 0x6414 header).
     const QByteArray user = bc::modernHash(m_p.username, nonce);
@@ -232,7 +234,11 @@ bool BaichuanControl::open()
         return false;
     }
     m_fail = Fail::None;
-    m_loginInfo = decryptReply(loginReply, m_aesKey);
+    // The login reply is XOR on every device; fall back to the session cipher.
+    m_loginInfo = bc::xorCrypt(loginReply.body.mid(static_cast<int>(loginReply.payloadOffset)),
+                               loginReply.chId);
+    if (!m_loginInfo.contains("<?xml"))
+        m_loginInfo = decryptReply(loginReply, m_aesKey);
     return true;
 }
 
@@ -244,6 +250,10 @@ static QByteArray decryptReply(const Msg &m, const QByteArray &key)
 {
     if (m.body.isEmpty())
         return {};
+    if (key.isEmpty()) { // XOR-only session: Extension and payload are XORed separately
+        const int off = static_cast<int>(m.payloadOffset);
+        return bc::xorCrypt(m.body.left(off), m.chId) + bc::xorCrypt(m.body.mid(off), m.chId);
+    }
     const QByteArray whole = bc::aesCfb(m.body, key, /*decrypt=*/true);
     if (whole.contains("<?xml") || whole.contains("<body"))
         return whole;
@@ -262,9 +272,8 @@ QByteArray BaichuanControl::transact(quint32 cmdId, int channel, const QByteArra
         return {};
     const quint8 chId = channel < 0 ? 250 : static_cast<quint8>(channel + 1);
     const QByteArray ext = channel < 0 ? QByteArray() : channelExtension(channel);
-    const QByteArray encExt = ext.isEmpty() ? QByteArray() : bc::aesCfb(ext, m_aesKey, false);
-    const QByteArray encBody =
-        bodyXml.isEmpty() ? QByteArray() : bc::aesCfb(bodyXml, m_aesKey, false);
+    const QByteArray encExt = bc::crypt(ext, m_aesKey, false, chId);
+    const QByteArray encBody = bc::crypt(bodyXml, m_aesKey, false, chId);
     const quint32 messId = (++m_messId) & 0xFFFFFF;
 
     m_sock->write(modernMessage(cmdId, chId, messId, encExt, encBody));
@@ -276,6 +285,74 @@ QByteArray BaichuanControl::transact(quint32 cmdId, int channel, const QByteArra
     if (statusOut)
         *statusOut = reply.status;
     return decryptReply(reply, m_aesKey);
+}
+
+QByteArray BaichuanControl::request(quint32 cmdId, const QByteArray &bodyXml, quint16 *statusOut)
+{
+    if (!isOpen())
+        return {};
+    const QByteArray encBody = bc::crypt(bodyXml, m_aesKey, false, 0);
+    const quint32 messId = (++m_messId) & 0xFFFFFF;
+    m_sock->write(modernMessage(cmdId, 0, messId, QByteArray(), encBody));
+    m_sock->flush();
+    Msg reply;
+    if (!recvMatch(m_sock.get(), m_netBuf, cmdId, reply))
+        return {};
+    if (statusOut)
+        *statusOut = reply.status;
+    return decryptReply(reply, m_aesKey);
+}
+
+quint16 BaichuanControl::requestMedia(quint32 cmdId, const QByteArray &bodyXml, int idleMs,
+                                     const std::function<bool(const QByteArray &)> &onPayload)
+{
+    if (!isOpen())
+        return 0;
+    const quint32 messId = (++m_messId) & 0xFFFFFF;
+    m_sock->write(modernMessage(cmdId, 0, messId, QByteArray(),
+                                bc::crypt(bodyXml, m_aesKey, false, 0)));
+    m_sock->flush();
+    quint16 status = 0;
+    Msg m;
+    for (;;) {
+        while (parseMessage(m_netBuf, m)) {
+            if (m.cmdId != cmdId)
+                continue;
+            const QByteArray ext = m.payloadOffset > 0
+                ? bc::crypt(m.body.left(static_cast<int>(m.payloadOffset)), m_aesKey, true, m.chId).toLower()
+                : QByteArray();
+            const QByteArray payload = m.body.mid(static_cast<int>(m.payloadOffset));
+            const bool binary = ext.contains("binarydata") || ext.contains("encryptlen");
+            if (!binary) {
+                if (status == 0)
+                    status = m.status;
+                if (status != 200)
+                    return status;
+                continue;
+            }
+            int encLen = 0;
+            const int a = ext.indexOf("<encryptlen>");
+            if (a >= 0)
+                encLen = ext.mid(a + 12, ext.indexOf("</encryptlen>", a) - a - 12).toInt();
+            const QByteArray media = encLen > 0 && !m_aesKey.isEmpty()
+                ? bc::aesCfb(payload.left(encLen), m_aesKey, true) + payload.mid(encLen)
+                : payload;
+            if (!onPayload(media))
+                return status;
+        }
+        if (!m_sock->waitForReadyRead(idleMs))
+            return status;
+        m_netBuf.append(m_sock->readAll());
+    }
+}
+
+void BaichuanControl::drain(int quietMs)
+{
+    if (!isOpen())
+        return;
+    while (m_sock->waitForReadyRead(quietMs))
+        m_sock->readAll();
+    m_netBuf.clear();
 }
 
 QByteArray BaichuanControl::get(quint32 cmdId, int channel, quint16 *statusOut)

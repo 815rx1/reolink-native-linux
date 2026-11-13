@@ -26,6 +26,66 @@ Item {
     }
 
     property var recordingDays: []
+    // ---- Clip list (cameras) ----
+    // Standalone cameras record many short clips; like the phone apps, they are
+    // listed one under another (newest first) with filter chips instead of a
+    // 24-hour timeline. NVRs, which record continuously, keep the timeline.
+    property var _keepCam: null            // [hostId, channel] across a model reset
+    property var clips: []                 // the day's segments for the selected camera
+    property var thumbs: ({})              // startEpoch -> file:// preview image
+    property string clipFilter: "all"      // all | person | vehicle | animal | motion
+    readonly property bool clipMode: deviceRow >= 0 && Devices.bcPlayback(deviceRow) && paneCount !== 4
+    function clipHas(seg, what) {
+        var k = seg.kinds || [];
+        if (what === "person")  return k.indexOf("people") >= 0 || k.indexOf("face") >= 0;
+        if (what === "vehicle") return k.indexOf("vehicle") >= 0 || k.indexOf("nonmotorveh") >= 0;
+        if (what === "animal")  return k.indexOf("dog_cat") >= 0;
+        if (what === "motion")  return k.indexOf("md") >= 0;
+        return true;
+    }
+    function clipCount(what) {
+        var n = 0;
+        for (var i = 0; i < clips.length; ++i) if (clipHas(clips[i], what)) ++n;
+        return n;
+    }
+    readonly property var shownClips: {
+        var out = [];
+        for (var i = clips.length - 1; i >= 0; --i)      // newest first
+            if (clipHas(clips[i], clipFilter)) out.push(clips[i]);
+        return out;
+    }
+    // Clip clicked: always open a FRESH Baichuan session at the clip's start.
+    // Seeking a running camera session in place is ignored by the cameras —
+    // the old clip just kept playing on the left.
+    function playClip(seg) {
+        if (page.deviceRow < 0)
+            return;
+        page.playheadSecs = seg.start;
+        player.stop();
+        player.loop = false;
+        statusText.text = page.hdMode ? qsTr("HD") : "";
+        Devices.startBaichuanPlayback(page.deviceRow, epochAt(seg.start), player, page.hdMode);
+    }
+
+    // Coming over from Live View: show the camera that was being watched there
+    // (today's clips, from the top — not the previous camera's playhead).
+    function selectCamera(row) {
+        if (row < 0 || row >= Devices.count || page.paneCount !== 1 || row === page.deviceRow)
+            return;
+        page.playheadSecs = 0;
+        page._pendingPlaySecs = -1;
+        deviceCombo.currentIndex = row;
+    }
+
+    function fmtClock(sec) {
+        var h = Math.floor(sec / 3600), m = Math.floor(sec / 60) % 60, s = Math.floor(sec) % 60;
+        return (h < 10 ? "0" : "") + h + ":" + (m < 10 ? "0" : "") + m + ":" + (s < 10 ? "0" : "") + s;
+    }
+    function fmtDuration(sec) {
+        sec = Math.max(0, Math.round(sec));
+        var m = Math.floor(sec / 60), s = sec % 60;
+        return m + ":" + (s < 10 ? "0" : "") + s;
+    }
     property real playheadSecs: 0    // playhead position (seconds into the day)
     // Manual view-rotation for the single-pane camera (grid panes carry their own).
     property int camRotation: 0
@@ -240,6 +300,7 @@ Item {
     }
 
     function refresh() {
+        page.clips = [];   // never show the previous camera's/day's clips
         if (page.paneCount === 4) {
             // One Search per distinct grid camera. These queue behind the
             // per-device request lock in ReolinkHttpClient rather than racing —
@@ -327,6 +388,14 @@ Item {
         // Scrub against the sub stream: it is light and always landscape, so the
         // timeline stays responsive. (HD mode below plays the full-res main.)
         player.loop = false;
+        if (Devices.bcPlayback(page.deviceRow)) {
+            // Cameras: the sub stream over Baichuan too (no HTTP-FLV on SD cards).
+            if (player.state === StreamPlayer.Streaming
+                && Devices.seekBaichuanPlayback(page.deviceRow, epochAt(sec)))
+                return;
+            Devices.startBaichuanPlayback(page.deviceRow, epochAt(sec), player, false);
+            return;
+        }
         var url = Devices.playbackUrl(page.deviceRow, epochAt(sec), false);
         if (url.length > 0) {
             player.expectedSize = Devices.declaredSize(page.deviceRow, false); // sub
@@ -401,6 +470,12 @@ Item {
             exportBtn.busy = false;
             statusText.text = qsTr("Export failed: %1").arg(error);
         }
+        function onClipThumbReady(row, startEpoch, url) {
+            if (row !== page.deviceRow) return;
+            var t = Object.assign({}, page.thumbs);
+            t[startEpoch] = url;
+            page.thumbs = t;
+        }
         function onRecordingsFound(row, segments) {
             if (page.paneCount === 4) {
                 if (page.gridRows.indexOf(row) < 0)
@@ -416,6 +491,17 @@ Item {
             }
             if (row === page.deviceRow) {
                 timeline.segments = segments;
+                page.clips = segments;
+                page.thumbs = ({});
+                if (page.clipMode && segments.length > 0) {
+                    // Newest first, so the clips at the top of the list come first.
+                    var ep = [];
+                    for (var ci = segments.length - 1; ci >= 0; --ci) {
+                        var sg = segments[ci];
+                        ep.push([sg.startEpoch, sg.startEpoch + (sg.end - sg.start)]);
+                    }
+                    Devices.requestClipThumbs(row, ep);
+                }
                 statusText.text = segments.length + qsTr(" recordings");
                 // Overlay this day's detection events as timeline markers.
                 var info = Devices.cameraInfo(page.deviceRow);
@@ -430,7 +516,10 @@ Item {
                     page._pendingPlaySecs = -1;
                     page._suppressResume = false; // event playback crosses file boundaries too
                     var url = Devices.playbackUrl(page.deviceRow, ep, false); // sub stream
-                    if (url.length > 0) {
+                    if (Devices.bcPlayback(page.deviceRow)) {
+                        player.loop = false;
+                        Devices.startBaichuanPlayback(page.deviceRow, ep, player, page.hdMode);
+                    } else if (url.length > 0) {
                         player.expectedSize = Devices.declaredSize(page.deviceRow, false);
                         player.source = url;
                         player.start();
@@ -501,6 +590,22 @@ Item {
         }
         function onRowsInserted() {
             if (page.paneCount === 4) { page.gridSegs = ({}); page.initGridRows(); page.refresh(); }
+        }
+        // Sidebar reorder: find the same camera at its new row.
+        function onModelAboutToBeReset() {
+            var c = page.deviceRow >= 0 ? Devices.cameraInfo(page.deviceRow) : null;
+            page._keepCam = c && c.hostId !== undefined ? [c.hostId, c.channel] : null;
+        }
+        function onModelReset() {
+            if (page.paneCount === 4) { page.gridSegs = ({}); page.initGridRows(); page.refresh(); }
+            if (page._keepCam) {
+                var r = Devices.rowOfHostChannel(page._keepCam[0], page._keepCam[1]);
+                page._keepCam = null;
+                if (r >= 0 && r !== deviceCombo.currentIndex) {
+                    page.deviceRow = r;          // same camera, new index: no reload
+                    deviceCombo.currentIndex = r;
+                }
+            }
         }
     }
 
@@ -802,6 +907,7 @@ Item {
 
             Timeline {
                 id: timeline
+                visible: !page.clipMode
                 Layout.fillWidth: true
                 position: page.playheadSecs
                 onSeek: (seconds) => page.playheadSecs = seconds  // move playhead only
@@ -926,15 +1032,16 @@ Item {
             }
         }
 
-        // ---- Right: calendar ----
+        // ---- Right: calendar (+ clip list for cameras) ----
         Rectangle {
-            Layout.preferredWidth: 240
+            Layout.preferredWidth: page.clipMode ? 340 : 240
             Layout.fillHeight: true
             color: Theme.surface
             border.color: Theme.border
             radius: Theme.radius
 
             MonthCalendar {
+                id: monthCal
                 anchors.top: parent.top
                 anchors.horizontalCenter: parent.horizontalCenter
                 anchors.topMargin: Theme.spacing
@@ -948,7 +1055,169 @@ Item {
                     // would make assignGridPane skip the search for a camera
                     // re-entering the grid and play the wrong day.
                     page.gridSegs = ({});
+                    page.clips = [];
                     page.refresh();
+                }
+            }
+
+            ColumnLayout {
+                visible: page.clipMode
+                anchors.top: monthCal.bottom
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                anchors.margins: Theme.spacing
+                spacing: 6
+
+                // Filter chips, each with its count; empty categories are hidden.
+                Flow {
+                    Layout.fillWidth: true
+                    spacing: 6
+                    Repeater {
+                        model: [
+                            { key: "all",     label: qsTr("All") },
+                            { key: "person",  label: qsTr("Person") },
+                            { key: "vehicle", label: qsTr("Vehicle") },
+                            { key: "animal",  label: qsTr("Animal") },
+                            { key: "motion",  label: qsTr("Motion") }
+                        ]
+                        delegate: Rectangle {
+                            required property var modelData
+                            readonly property int count: page.clipCount(modelData.key)
+                            visible: modelData.key === "all" || count > 0
+                            width: chipText.implicitWidth + 20
+                            height: 26
+                            radius: 13
+                            color: page.clipFilter === modelData.key ? Theme.accentDim : Theme.surfaceAlt
+                            border.color: page.clipFilter === modelData.key ? Theme.accent : Theme.border
+                            Text {
+                                id: chipText
+                                anchors.centerIn: parent
+                                text: parent.modelData.label + " " + parent.count
+                                color: Theme.text
+                                font.pixelSize: 12
+                            }
+                            TapHandler { onTapped: page.clipFilter = parent.modelData.key }
+                        }
+                    }
+                }
+
+                Text {
+                    visible: page.shownClips.length === 0
+                    Layout.fillWidth: true
+                    text: page.clips.length === 0 ? qsTr("No recordings for this day")
+                                                  : qsTr("No clips of this type")
+                    color: Theme.textMuted
+                    font.pixelSize: 12
+                    wrapMode: Text.WordWrap
+                }
+
+                ListView {
+                    id: clipList
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    clip: true
+                    spacing: 4
+                    model: page.shownClips
+                    ScrollBar.vertical: ScrollBar { }
+                    delegate: Rectangle {
+                        id: clipRow
+                        required property var modelData
+                        readonly property bool playing:
+                            page.playheadSecs >= modelData.start && page.playheadSecs < modelData.end
+                        width: ListView.view.width
+                        height: 66
+                        radius: Theme.radius
+                        color: playing ? Theme.accentDim
+                             : clipHover.hovered ? Theme.surfaceAlt : "transparent"
+                        border.color: playing ? Theme.accent : Theme.border
+
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.margins: 8
+                            spacing: 10
+                            // Preview frame (fetched in the background).
+                            Rectangle {
+                                Layout.preferredWidth: 88
+                                Layout.preferredHeight: 50
+                                radius: 4
+                                color: Theme.paneBackground
+                                clip: true
+                                Image {
+                                    anchors.fill: parent
+                                    fillMode: Image.PreserveAspectCrop
+                                    asynchronous: true
+                                    source: page.thumbs[clipRow.modelData.startEpoch] || ""
+                                }
+                            }
+                            // Colour bar: the kind of event at a glance.
+                            Rectangle {
+                                Layout.preferredWidth: 4
+                                Layout.fillHeight: true
+                                radius: 2
+                                color: page.clipHas(clipRow.modelData, "person") ? "#e5534b"
+                                     : page.clipHas(clipRow.modelData, "vehicle") ? "#d29922"
+                                     : page.clipHas(clipRow.modelData, "animal") ? "#3fb950"
+                                     : page.clipHas(clipRow.modelData, "motion") ? Theme.accent
+                                     : Theme.textMuted
+                            }
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                spacing: 3
+                                RowLayout {
+                                    spacing: 8
+                                    Text {
+                                        text: page.fmtClock(clipRow.modelData.start)
+                                        color: Theme.text
+                                        font.pixelSize: 14
+                                        font.bold: true
+                                    }
+                                    Text {
+                                        text: page.fmtDuration(clipRow.modelData.end - clipRow.modelData.start)
+                                        color: Theme.textMuted
+                                        font.pixelSize: 12
+                                    }
+                                }
+                                Row {
+                                    spacing: 4
+                                    Repeater {
+                                        model: {
+                                            var b = [];
+                                            var m = clipRow.modelData;
+                                            if (page.clipHas(m, "person"))  b.push({ t: qsTr("Person"),  c: "#e5534b" });
+                                            if (page.clipHas(m, "vehicle")) b.push({ t: qsTr("Vehicle"), c: "#d29922" });
+                                            if (page.clipHas(m, "animal"))  b.push({ t: qsTr("Animal"),  c: "#3fb950" });
+                                            if (page.clipHas(m, "motion"))  b.push({ t: qsTr("Motion"),  c: Theme.accent });
+                                            if (b.length === 0)             b.push({ t: qsTr("Continuous"), c: Theme.textMuted });
+                                            return b;
+                                        }
+                                        delegate: Rectangle {
+                                            required property var modelData
+                                            width: badgeText.implicitWidth + 10
+                                            height: 16
+                                            radius: 3
+                                            color: "transparent"
+                                            border.color: modelData.c
+                                            Text {
+                                                id: badgeText
+                                                anchors.centerIn: parent
+                                                text: parent.modelData.t
+                                                color: parent.modelData.c
+                                                font.pixelSize: 10
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Text {
+                                text: clipRow.playing ? "▶" : ""
+                                color: Theme.accent
+                                font.pixelSize: 14
+                            }
+                        }
+                        HoverHandler { id: clipHover; cursorShape: Qt.PointingHandCursor }
+                        TapHandler { onTapped: page.playClip(clipRow.modelData) }
+                    }
                 }
             }
         }

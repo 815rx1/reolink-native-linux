@@ -206,6 +206,9 @@ Item {
                 page.syncSlots();
         }
         function onModelReset() {
+            // Rows were reordered/replaced: row-based selection is stale.
+            page.maximizedIndex = -1;
+            page.selectedIndex = -1;
             page.paneSlots = [];
             page.layoutRestored = false;
             page.restoreLayout();

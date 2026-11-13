@@ -75,4 +75,11 @@ QByteArray aesCfb(const QByteArray &in, const QByteArray &key, bool decrypt)
     return out;
 }
 
+QByteArray crypt(const QByteArray &in, const QByteArray &aesKey, bool decrypt, quint8 xorOffset)
+{
+    if (in.isEmpty())
+        return in;
+    return aesKey.isEmpty() ? xorCrypt(in, xorOffset) : aesCfb(in, aesKey, decrypt);
+}
+
 } // namespace rl::bc
