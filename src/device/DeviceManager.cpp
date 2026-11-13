@@ -18,11 +18,72 @@
 #include <QUrl>
 #include <QVariant>
 #include <QThread>
+#include <QThreadPool>
+
+#include <map>
+#include <memory>
 #include <QtConcurrent/QtConcurrent>
 
 namespace rl {
 
 namespace {
+// Baichuan-only hosts: devices with HTTP(S) switched off (the E1 series' factory
+// default). They are stored with their Baichuan port (9000, or 9001–9099 when the
+// user shifted it, e.g. for port forwarding) and https=false — HTTP APIs don't
+// live in that range — so no schema change is needed to tell them apart.
+// Everything for them goes over the Baichuan port; HTTP-only features report
+// "device not ready" instead of timing out against a closed port.
+constexpr int kBaichuanPort = 9000;
+constexpr int kBaichuanPortMax = 9099;
+bool isBaichuanPort(int port)
+{
+    return port >= kBaichuanPort && port <= kBaichuanPortMax;
+}
+bool isBaichuanOnly(const HostRecord &r)
+{
+    return r.kind != QLatin1String("stream") && isBaichuanPort(r.port) && !r.https;
+}
+
+// First <tag>value</tag> in a Baichuan XML reply (flat device-info blocks).
+QString bcTag(const QByteArray &xml, const char *tag)
+{
+    const QByteArray open = QByteArray("<") + tag + ">";
+    const QByteArray close = QByteArray("</") + tag + ">";
+    const int a = xml.indexOf(open);
+    if (a < 0)
+        return {};
+    const int b = xml.indexOf(close, a + open.size());
+    return b < 0 ? QString() : QString::fromUtf8(xml.mid(a + open.size(), b - a - open.size())).trimmed();
+}
+
+// Name/model/channel count of a logged-in Baichuan device: the login reply's
+// DeviceInfo plus cmd 80 (VersionInfo). Tag names vary across firmware, so
+// several are tried; whatever is missing falls back (name -> address, model ->
+// "Reolink", channels -> 1).
+void bcDeviceInfo(BaichuanControl &bc, const QString &addr, QString *name, QString *model,
+                  int *channels)
+{
+    const QByteArray login = bc.loginInfo();
+    const QByteArray ver = bc.get(80, -1);
+    *name = bcTag(ver, "name");
+    if (name->isEmpty())
+        *name = bcTag(login, "name");
+    *model = bcTag(ver, "model");
+    if (model->isEmpty())
+        *model = bcTag(login, "model");
+    if (model->isEmpty())
+        *model = bcTag(ver, "type");
+    const int ch = bcTag(login, "channelNum").toInt();
+    *channels = ch > 0 ? ch : 1;
+    qCInfo(lcProto).noquote() << "baichuan device info" << addr << "name:" << *name
+                               << "model:" << *model << "channels:" << *channels
+                               << "| version tags:" << bcTag(ver, "type") << bcTag(ver, "detail");
+    if (name->isEmpty())
+        *name = addr;
+    if (model->isEmpty())
+        *model = QStringLiteral("Reolink");
+}
+
 // Firmware spells the codec several ways ("h265", "H265", "hevc") and newer
 // builds sometimes omit the field entirely. Empty result = unknown, and an
 // unknown codec is PROBED from the stream rather than assumed — assuming h264
@@ -388,7 +449,34 @@ void DeviceManager::testDevice(const QString &addr, const QString &username,
                                const QString &password, bool https, int port)
 {
     const int portv = port > 0 ? port : (https ? 443 : 80);
-    m_pending.addFuture(QtConcurrent::run([this, addr, username, password, https, portv] {
+    const bool explicitPort = port > 0;
+    // A Baichuan port given (from discovery, or typed): skip HTTP entirely.
+    const bool bcPortGiven = !https && isBaichuanPort(port);
+    m_pending.addFuture(QtConcurrent::run([this, addr, username, password, https, portv,
+                                           explicitPort, bcPortGiven] {
+        if (bcPortGiven) {
+            BaichuanControl bc({addr, portv, username, password});
+            bool ok = bc.open();
+            QString name, model, message, problem;
+            if (ok) {
+                int channels = 1;
+                bcDeviceInfo(bc, addr, &name, &model, &channels);
+            } else if (bc.lastFail() == BaichuanControl::Fail::Auth) {
+                problem = QStringLiteral("auth");
+                message = tr("wrong username or password");
+            } else {
+                problem = QStringLiteral("transport");
+                message = tr("unreachable");
+            }
+            QMetaObject::invokeMethod(
+                this,
+                [this, ok, message, name, model, problem] {
+                    emit testDeviceResult(ok, message, name, model, problem,
+                                          QStringLiteral("baichuan"));
+                },
+                Qt::QueuedConnection);
+            return;
+        }
         ReolinkHttpClient client(addr, portv, https, username, password);
         const api::BatchResult b =
             client.call(Json::array({api::command(QStringLiteral("GetDevInfo"))}));
@@ -419,10 +507,29 @@ void DeviceManager::testDevice(const QString &addr, const QString &username,
         if (!ok && problem.isEmpty())
             problem = QStringLiteral("protocol");
 
+        // No HTTP(S) answer at all: the device may have its web server switched
+        // off (E1 series default). Try the Baichuan port before giving up — a
+        // success adds the device in Baichuan-only mode.
+        QString transport = QStringLiteral("http");
+        if (!ok && problem == QLatin1String("transport") && !explicitPort) {
+            BaichuanControl bc({addr, kBaichuanPort, username, password});
+            if (bc.open()) {
+                int channels = 1;
+                bcDeviceInfo(bc, addr, &name, &model, &channels);
+                ok = true;
+                problem.clear();
+                message.clear();
+                transport = QStringLiteral("baichuan");
+            } else if (bc.lastFail() == BaichuanControl::Fail::Auth) {
+                problem = QStringLiteral("auth");
+                message = tr("wrong username or password");
+            }
+        }
+
         QMetaObject::invokeMethod(
             this,
-            [this, ok, message, name, model, problem] {
-                emit testDeviceResult(ok, message, name, model, problem);
+            [this, ok, message, name, model, problem, transport] {
+                emit testDeviceResult(ok, message, name, model, problem, transport);
             },
             Qt::QueuedConnection);
     }));
@@ -638,6 +745,8 @@ void DeviceManager::applyValidation(qint64 hostId, const Validation &v)
         e.mainSize = ch.mainSize;
         e.subSize = ch.subSize;
         e.uid = ch.uid;
+        e.bcPort = v.bcPort;
+        e.rtspPort = v.rtspPort;
         e.caps = ch.caps;
         e.talk = ch.caps.talk;
         e.isAdmin = v.isAdmin;
@@ -716,6 +825,46 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
             return;
         }
 
+        if (isBaichuanOnly(rec)) {
+            Validation v;
+            v.password = password;
+            v.bcPort = rec.port;
+            BaichuanControl bc({rec.addr, rec.port, rec.username, password});
+            if (!bc.open()) {
+                if (bc.lastFail() == BaichuanControl::Fail::Auth) {
+                    v.status = tr("wrong username or password");
+                    v.problem = Problem::Auth;
+                } else {
+                    v.status = tr("unreachable");
+                    v.problem = Problem::Unreachable;
+                }
+                postValidation(hostId, v);
+                return;
+            }
+            QString name, model;
+            int channels = 1;
+            bcDeviceInfo(bc, rec.addr, &name, &model, &channels);
+            bc.close(); // free the device's session slot for the live stream
+            v.online = true;
+            v.problem = Problem::None;
+            v.status = tr("online");
+            v.hostName = name;
+            v.model = model;
+            v.channelNum = 1; // standalone camera; NVRs always have the HTTP API
+            ChannelResult cr;
+            cr.channel = 0;
+            cr.name = name;
+            cr.online = true; // codec stays unknown: the stream is probed
+            // No HTTP GetAbility here; the pan/tilt models are known by name
+            // (E1 series, Argus PT, TrackMix). Zoom stays digital (the pane's).
+            cr.caps.ptz = model.contains(QLatin1String("E1"))
+                          || model.contains(QLatin1String("PT"))
+                          || model.contains(QLatin1String("TrackMix"), Qt::CaseInsensitive);
+            v.channels.append(cr);
+            postValidation(hostId, v);
+            return;
+        }
+
         auto client = std::make_shared<ReolinkHttpClient>(rec.addr, rec.port, rec.https,
                                                           rec.username, password);
         // Phase 1: device info, ch0 encoding, abilities, battery, and the NVR
@@ -727,6 +876,7 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
                          Json{{"User", {{"userName", rec.username.toStdString()}}}}),
             api::command(QStringLiteral("GetBatteryInfo"), Json{{"channel", 0}}),
             api::command(QStringLiteral("GetChannelstatus")),
+            api::command(QStringLiteral("GetNetPort")),
         }));
 
         Validation v;
@@ -759,6 +909,14 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
                     v.battery = api::parseBatteryInfo(r.value);
                 } else if (r.cmd == QLatin1String("GetChannelstatus") && r.ok) {
                     channels = api::parseChannelStatus(r.value);
+                } else if (r.cmd == QLatin1String("GetNetPort") && r.ok) {
+                    // Ports are user-configurable (shifted for port forwarding);
+                    // live/control must use the device's, not the defaults.
+                    const Json np = jsonObj(r.value, "NetPort");
+                    v.bcPort = jsonInt(np, "mediaPort", kBaichuanPort);
+                    v.rtspPort = jsonInt(np, "rtspPort", 554);
+                    if (v.bcPort <= 0) v.bcPort = kBaichuanPort;
+                    if (v.rtspPort <= 0) v.rtspPort = 554;
                 }
             }
         }
@@ -853,7 +1011,7 @@ std::shared_ptr<ReolinkHttpClient> DeviceManager::clientFor(int row)
     if (row < 0 || row >= m_entries.size())
         return {};
     Entry &e = m_entries[row];
-    if (e.rec.kind == QLatin1String("stream") || !e.primed)
+    if (e.rec.kind == QLatin1String("stream") || !e.primed || isBaichuanOnly(e.rec))
         return {};
     if (!e.client)
         e.client = std::make_shared<ReolinkHttpClient>(e.rec.addr, e.rec.port, e.rec.https,
@@ -861,8 +1019,64 @@ std::shared_ptr<ReolinkHttpClient> DeviceManager::clientFor(int row)
     return e.client;
 }
 
+// PTZ for Baichuan-only devices (cmd 18, PtzControl). Commands go through one
+// dedicated, never-expiring worker thread: that keeps press -> release strictly
+// ordered (a "stop" overtaking its "left" would leave the camera turning) and
+// lets one logged-in connection per host be reused — the sockets never change
+// thread, and a press responds without a fresh login each time.
+void DeviceManager::bcPtz(int row, const QString &command, int speed)
+{
+    if (row < 0 || row >= m_entries.size())
+        return;
+    const Entry &e = m_entries.at(row);
+    if (!e.primed)
+        return;
+    const BaichuanControl::Params p{e.rec.addr, e.bcPort, e.rec.username, e.password};
+    const qint64 hostId = e.rec.id;
+    const int ch = e.channel;
+    static QThreadPool *pool = [] {
+        auto *tp = new QThreadPool;
+        tp->setMaxThreadCount(1);
+        tp->setExpiryTimeout(-1);
+        return tp;
+    }();
+    m_pending.addFuture(QtConcurrent::run(pool, [p, hostId, ch, command, speed] {
+        static std::map<qint64, std::unique_ptr<BaichuanControl>> conns; // pool thread only
+        const QByteArray body =
+            QByteArrayLiteral("<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<body>\n"
+                              "<PtzControl version=\"1.1\">\n<channelId>")
+            + QByteArray::number(ch) + QByteArrayLiteral("</channelId>\n<speed>")
+            + QByteArray::number(qBound(1, speed, 64)) + QByteArrayLiteral("</speed>\n<command>")
+            + command.toUtf8() + QByteArrayLiteral("</command>\n</PtzControl>\n</body>\n");
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            auto &c = conns[hostId];
+            if (!c || !c->isOpen()) {
+                c = std::make_unique<BaichuanControl>(p);
+                if (!c->open()) {
+                    c.reset();
+                    qCWarning(lcProto) << "ptz: baichuan login failed for" << p.host;
+                    return;
+                }
+            }
+            quint16 status = 0;
+            c->transact(18, ch, body, &status);
+            if (status != 0) {
+                if (status != 200)
+                    qCWarning(lcProto) << "ptz" << command << "rejected, status" << status;
+                return;
+            }
+            c.reset(); // no reply: stale connection — reconnect once
+        }
+    }));
+}
+
 void DeviceManager::ptzMove(int row, const QString &op, int speed)
 {
+    if (baichuanOnly(row)) {
+        // HTTP op names ("Left", "LeftUp", …) -> Baichuan ("left", "leftUp", …)
+        bcPtz(row, op.left(1).toLower() + op.mid(1), speed);
+        return;
+    }
     auto client = clientFor(row);
     if (!client)
         return;
@@ -873,6 +1087,10 @@ void DeviceManager::ptzMove(int row, const QString &op, int speed)
 
 void DeviceManager::ptzStop(int row)
 {
+    if (baichuanOnly(row)) {
+        bcPtz(row, QStringLiteral("stop"), 32);
+        return;
+    }
     auto client = clientFor(row);
     if (!client)
         return;
@@ -1227,7 +1445,7 @@ void DeviceManager::startBaichuan(int row, qint64 startEpoch, StreamPlayer *play
 
     BaichuanClient::Params p;
     p.host = e.rec.addr;
-    p.port = 9000; // Baichuan is a separate port from the HTTP API
+    p.port = e.bcPort; // Baichuan is a separate port from the HTTP API (configurable)
     p.username = e.rec.username;
     p.password = e.password;
     p.channel = e.channel;
@@ -1536,6 +1754,7 @@ void DeviceManager::fetchAlerts(int row)
     }
     BaichuanControl::Params p;
     p.host = e.rec.addr;
+    p.port = e.bcPort;
     p.username = e.rec.username;
     p.password = e.password;
     const int ch = e.channel;
@@ -1623,6 +1842,7 @@ void DeviceManager::setAlertEnable(int row, const QString &kind, bool enable)
         return;
     BaichuanControl::Params p;
     p.host = e.rec.addr;
+    p.port = e.bcPort;
     p.username = e.rec.username;
     p.password = e.password;
     const int ch = e.channel;
@@ -1653,7 +1873,7 @@ void DeviceManager::fetchRecSchedule(int row)
         emit recScheduleLoaded(row, {});
         return;
     }
-    BaichuanControl::Params p{e.rec.addr, 9000, e.rec.username, e.password};
+    BaichuanControl::Params p{e.rec.addr, e.bcPort, e.rec.username, e.password};
     const int ch = e.channel;
     m_pending.addFuture(QtConcurrent::run([this, row, p, ch] {
         QVariantMap m;
@@ -1695,7 +1915,7 @@ void DeviceManager::writeRecSchedule(int row, const QString &type, const QString
                             tr("requires an administrator account"));
         return;
     }
-    BaichuanControl::Params p{e.rec.addr, 9000, e.rec.username, e.password};
+    BaichuanControl::Params p{e.rec.addr, e.bcPort, e.rec.username, e.password};
     const int ch = e.channel;
     const QByteArray typeTag = "<type>" + type.toLatin1() + "</type>";
     const QByteArray newTable = table.toLatin1();
@@ -1745,6 +1965,7 @@ void DeviceManager::fetchBcConfig(int row, int cmdId, const QString &reqBody)
     }
     BaichuanControl::Params p;
     p.host = e.rec.addr;
+    p.port = e.bcPort;
     p.username = e.rec.username;
     p.password = e.password;
     const int ch = e.channel;
@@ -1775,6 +1996,7 @@ void DeviceManager::writeBcConfig(int row, int getCmd, int setCmd, const QVarian
     }
     BaichuanControl::Params p;
     p.host = e.rec.addr;
+    p.port = e.bcPort;
     p.username = e.rec.username;
     p.password = e.password;
     const int ch = e.channel;
@@ -1819,12 +2041,18 @@ QString DeviceManager::liveUrl(int row, bool mainStream)
         return u.toString(QUrl::FullyEncoded);
     }
 
-    if (!e.primed)
-        return {};
+    if (!e.primed || isBaichuanOnly(e.rec))
+        return {}; // Baichuan-only: live goes over startBaichuanLive for both streams
     // Sub stream ("Fluent") is h264 on all models; main ("Clear") may be h265.
     const QString codec = (mainStream && !e.mainCodec.isEmpty()) ? e.mainCodec
                                                                  : QStringLiteral("h264");
-    return api::rtspUrl(e.rec.addr, e.rec.username, e.password, e.channel, mainStream, codec);
+    return api::rtspUrl(e.rec.addr, e.rec.username, e.password, e.channel, mainStream, codec,
+                        e.rtspPort);
+}
+
+bool DeviceManager::baichuanOnly(int row) const
+{
+    return row >= 0 && row < m_entries.size() && isBaichuanOnly(m_entries.at(row).rec);
 }
 
 } // namespace rl

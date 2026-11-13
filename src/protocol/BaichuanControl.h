@@ -73,12 +73,29 @@ public:
 
     bool isOpen() const;
 
+    // Why the last open() failed: Transport (no TCP/hello reply — unreachable or
+    // not a Reolink device) or Auth (the device answered the login with an error
+    // status — wrong username/password, or a locked account).
+    enum class Fail { None, Transport, Auth };
+    Fail lastFail() const { return m_fail; }
+
+    // The decrypted XML the device returned with a successful login (it carries
+    // a <DeviceInfo> block on most firmware). Empty if none / not decodable.
+    QByteArray loginInfo() const { return m_loginInfo; }
+
+    // Unauthenticated check that host:port speaks Baichuan: send the legacy
+    // hello and expect a nonce back. Cheap (no login, so no lockout counter);
+    // used by network discovery to recognise devices with HTTP(S) switched off.
+    static bool probe(const QString &host, int port, int timeoutMs);
+
 private:
     Params m_p;
     std::unique_ptr<QTcpSocket> m_sock;
     QByteArray m_aesKey;
     QByteArray m_netBuf;      // socket bytes buffered past the last parsed reply
     quint32 m_messId = 0;     // per-connection RPC counter
+    Fail m_fail = Fail::None;
+    QByteArray m_loginInfo;
 };
 
 } // namespace rl

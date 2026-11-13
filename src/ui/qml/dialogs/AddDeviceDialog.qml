@@ -24,6 +24,7 @@ Dialog {
     // the ones that pass are added, the rest are listed with the reason.
     property var bulkQueue: []
     property string bulkCurrent: ""
+    property int bulkCurrentPort: 0   // Baichuan port of the device being probed (0 = HTTP)
     property int bulkTotal: 0
     property int bulkAdded: 0
     property var bulkFailed: []
@@ -37,13 +38,17 @@ Dialog {
         }
         return false;
     }
+    // Discovery info "bc:<port>" = Baichuan only (HTTP off) on that port.
+    function bcPortOf(info) {
+        return info && info.indexOf("bc:") === 0 ? parseInt(info.substring(3)) : 0;
+    }
     function newDiscovered() {
         var out = [];
         Devices.count; // re-evaluate bindings when devices are added
         for (var i = 0; i < discoveredModel.count; ++i) {
-            var ip = discoveredModel.get(i).ip;
-            if (!isKnownAddr(ip))
-                out.push(ip);
+            var d = discoveredModel.get(i);
+            if (!isKnownAddr(d.ip))
+                out.push({ ip: d.ip, port: bcPortOf(d.info) });
         }
         return out;
     }
@@ -74,11 +79,16 @@ Dialog {
             return;
         }
         var q = bulkQueue.slice();
-        bulkCurrent = q.shift();
+        var next = q.shift();
+        bulkCurrent = next.ip;
+        bulkCurrentPort = next.port;
         bulkQueue = q;
         testing = true;
-        Devices.testDevice(bulkCurrent, userField.text, passwordField.text, httpsCheck.checked,
-                           portField.text.length > 0 ? parseInt(portField.text) : 0);
+        if (next.port > 0)
+            Devices.testDevice(next.ip, userField.text, passwordField.text, false, next.port);
+        else
+            Devices.testDevice(next.ip, userField.text, passwordField.text, httpsCheck.checked,
+                               portField.text.length > 0 ? parseInt(portField.text) : 0);
     }
     function problemText(problem, message) {
         if (problem === "transport") return qsTr("not reachable");
@@ -116,14 +126,18 @@ Dialog {
 
     Connections {
         target: Devices
-        function onTestDeviceResult(ok, message, name, model, problem) {
+        // transport "baichuan": the device has HTTP(S) off and answered on the
+        // Baichuan port — store it with port 9000 / no HTTPS (Baichuan-only mode).
+        function onTestDeviceResult(ok, message, name, model, problem, transport) {
+            var bcOnly = transport === "baichuan";
             if (!dialog.visible || !dialog.testing)
                 return;
             if (dialog.bulkRunning) {
                 if (ok) {
                     Devices.addDevice(dialog.bulkCurrent, userField.text, passwordField.text,
-                                      httpsCheck.checked,
-                                      portField.text.length > 0 ? parseInt(portField.text) : 0);
+                                      bcOnly ? false : httpsCheck.checked,
+                                      bcOnly ? (dialog.bulkCurrentPort > 0 ? dialog.bulkCurrentPort : 9000)
+                                             : portField.text.length > 0 ? parseInt(portField.text) : 0);
                     dialog.bulkAdded++;
                 } else {
                     var f = dialog.bulkFailed.slice();
@@ -135,9 +149,11 @@ Dialog {
             }
             dialog.testing = false;
             if (ok) {
+                var typedPort = portField.text.length > 0 ? parseInt(portField.text) : 0;
                 Devices.addDevice(addrField.text.trim(), userField.text,
-                                  passwordField.text, httpsCheck.checked,
-                                  portField.text.length > 0 ? parseInt(portField.text) : 0);
+                                  passwordField.text, bcOnly ? false : httpsCheck.checked,
+                                  bcOnly ? (typedPort >= 9000 && typedPort <= 9099 ? typedPort : 9000)
+                                         : typedPort);
                 dialog.close();
                 return;
             }
@@ -353,6 +369,7 @@ Dialog {
                         model: discoveredModel
                         delegate: Rectangle {
                             required property string ip
+                            required property string info
                             required property int index
                             width: ListView.view.width
                             height: 28
@@ -371,14 +388,31 @@ Dialog {
                                 Item { Layout.fillWidth: true }
                                 Text {
                                     text: (Devices.count, dialog.isKnownAddr(parent.parent.ip))
-                                          ? qsTr("already added") : qsTr("Reolink")
+                                          ? qsTr("already added")
+                                          : dialog.bcPortOf(parent.parent.info) > 0
+                                            ? qsTr("Reolink (Baichuan, no HTTP)")
+                                              + (dialog.bcPortOf(parent.parent.info) !== 9000
+                                                 ? " · " + qsTr("port %1").arg(dialog.bcPortOf(parent.parent.info)) : "")
+                                          : qsTr("Reolink")
                                     color: Theme.textMuted
                                     font.pixelSize: 10
                                     rightPadding: 8
                                 }
                             }
                             HoverHandler { id: dHover }
-                            TapHandler { onTapped: addrField.text = parent.ip }
+                            TapHandler {
+                                onTapped: {
+                                    addrField.text = parent.ip;
+                                    var bp = dialog.bcPortOf(parent.info);
+                                    if (bp > 0) {
+                                        portField.text = bp;
+                                        httpsCheck.checked = false;
+                                    } else {
+                                        portField.text = "";
+                                        httpsCheck.checked = true;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -517,5 +551,6 @@ Dialog {
         errorText = "";
         bulkQueue = [];
         bulkCurrent = "";
+        bulkCurrentPort = 0;
     }
 }

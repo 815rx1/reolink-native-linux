@@ -1,5 +1,7 @@
 #include "DeviceDiscovery.h"
 
+#include "protocol/BaichuanControl.h"
+
 #include "core/Log.h"
 
 #include <QNetworkInterface>
@@ -51,12 +53,23 @@ bool confirmReolink(const QString &ip)
     return rc == CURLE_OK && body.contains("rspCode") && body.contains("cmd");
 }
 
-bool portOpen(const QString &ip, int port)
+enum class PortState { Open, Refused, NoAnswer };
+
+// Open, or refused (the host is up — it answered with a RST), or no answer.
+PortState probePort(const QString &ip, int port, int timeoutMs = kPortConnectMs)
 {
     QTcpSocket sock;
     sock.connectToHost(ip, static_cast<quint16>(port));
-    return sock.waitForConnected(kPortConnectMs);
+    if (sock.waitForConnected(timeoutMs))
+        return PortState::Open;
+    return sock.error() == QAbstractSocket::ConnectionRefusedError ? PortState::Refused
+                                                                    : PortState::NoAnswer;
 }
+
+// Users shift the Baichuan port (e.g. 9001, 9002, … one per camera for router
+// port forwarding). Hosts that are up but refuse 9000 get this range probed too.
+constexpr int kAltPortFirst = 9001;
+constexpr int kAltPortLast = 9099;
 
 // All host IPs on the machine's IPv4 /24 subnets (private ranges only).
 QStringList localSubnetHosts()
@@ -119,6 +132,7 @@ void DeviceDiscovery::scan()
     if (m_scanning)
         return;
     m_found.clear();
+    m_alive.clear();
     setScanning(true);
 
     const QStringList hosts = localSubnetHosts();
@@ -140,16 +154,68 @@ void DeviceDiscovery::scan()
     for (const QString &ip : hosts) {
         auto *watcher = new QFutureWatcher<QString>(this);
         connect(watcher, &QFutureWatcher<QString>::finished, this, [this, watcher] {
-            const QString ip = watcher->result();
+            // "ip" or "ip|info"
+            const QString res = watcher->result();
             watcher->deleteLater();
-            if (!ip.isEmpty())
-                reportFound(ip, QStringLiteral("https"));
+            const QString ip = res.section(u'|', 0, 0);
+            const QString info = res.section(u'|', 1, 1);
+            if (info == QLatin1String("alive"))
+                m_alive.append(ip);
+            else if (!res.isEmpty())
+                reportFound(ip, info);
+            if (--m_pending <= 0)
+                scanAltPorts();
+        });
+        watcher->setFuture(QtConcurrent::run(pool, [ip]() -> QString {
+            const PortState st = probePort(ip, kReolinkPort);
+            if (st == PortState::Refused)
+                return ip + QStringLiteral("|alive"); // up, but not on 9000
+            if (st != PortState::Open)
+                return {};
+            if (confirmReolink(ip))
+                return ip + QStringLiteral("|https");
+            // HTTP(S) switched off — the default on e.g. the E1 series. The
+            // Baichuan port still answers an unauthenticated hello with a nonce,
+            // which is just as specific a Reolink signature; such devices are
+            // added in Baichuan-only mode.
+            if (BaichuanControl::probe(ip, kReolinkPort, kPortConnectMs * 2))
+                return ip + QStringLiteral("|bc:") + QString::number(kReolinkPort);
+            return {};
+        }));
+    }
+}
+
+// Phase 2: hosts that are up but refused 9000 may run Baichuan on a shifted
+// port. On a LAN a closed port is refused instantly, so ~100 probes per live
+// host cost well under a second.
+void DeviceDiscovery::scanAltPorts()
+{
+    const QStringList alive = m_alive;
+    m_alive.clear();
+    m_pending = alive.size();
+    if (m_pending == 0) {
+        setScanning(false);
+        return;
+    }
+    qCInfo(lcCore) << "discovery: checking" << m_pending << "more hosts for shifted Baichuan ports";
+    for (const QString &ip : alive) {
+        auto *watcher = new QFutureWatcher<QString>(this);
+        connect(watcher, &QFutureWatcher<QString>::finished, this, [this, watcher] {
+            const QString res = watcher->result();
+            watcher->deleteLater();
+            if (!res.isEmpty())
+                reportFound(res.section(u'|', 0, 0), res.section(u'|', 1, 1));
             if (--m_pending <= 0)
                 setScanning(false);
         });
-        watcher->setFuture(QtConcurrent::run(pool, [ip]() -> QString {
-            if (portOpen(ip, kReolinkPort) && confirmReolink(ip))
-                return ip;
+        watcher->setFuture(QtConcurrent::run([ip]() -> QString {
+            for (int port = kAltPortFirst; port <= kAltPortLast; ++port) {
+                const PortState st = probePort(ip, port, 300);
+                if (st == PortState::NoAnswer)
+                    return {}; // filtered host — don't spend 30 s on it
+                if (st == PortState::Open && BaichuanControl::probe(ip, port, kPortConnectMs * 2))
+                    return ip + QStringLiteral("|bc:") + QString::number(port);
+            }
             return {};
         }));
     }

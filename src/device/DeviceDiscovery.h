@@ -25,17 +25,19 @@ public:
 
 signals:
     void scanningChanged();
-    // A confirmed Reolink device at ip (info: a short hint, e.g. "https" / "onvif").
+    // A confirmed Reolink device at ip (info: "https" = full HTTP API, "bc:<port>" = Baichuan only on that port).
     void deviceFound(const QString &ip, const QString &info);
     void scanFinished();
 
 private:
     void setScanning(bool s);
     void reportFound(const QString &ip, const QString &info);
+    void scanAltPorts();
 
     bool m_scanning = false;
     int m_pending = 0;          // outstanding probe tasks (GUI thread only)
     QStringList m_found;        // dedupe
+    QStringList m_alive;        // up but refused 9000 — phase-2 candidates
 };
 
 } // namespace rl

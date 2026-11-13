@@ -107,6 +107,9 @@ public:
 
     // Playable URL for a device row; empty when credentials aren't loaded yet.
     Q_INVOKABLE QString liveUrl(int row, bool mainStream = true);
+    // True for a device added without HTTP(S) (only the Baichuan port answers):
+    // live view must use startBaichuanLive for the sub stream too.
+    Q_INVOKABLE bool baichuanOnly(int row) const;
 
     // GetEnc-declared display size for a channel's main/sub stream (e.g. main
     // 7680x2160). Lets StreamPlayer detect a transmitted-rotated stream by
@@ -239,8 +242,11 @@ signals:
     void deviceError(const QString &addr, const QString &message);
     // Outcome of testDevice. problem is "", "transport", "auth", "locked" or
     // "protocol" so the dialog can phrase the failure usefully.
+    // transport: "http" (full HTTP API) or "baichuan" (HTTP(S) off, add on port
+    // 9000 in Baichuan-only mode).
     void testDeviceResult(bool ok, const QString &message, const QString &name,
-                          const QString &model, const QString &problem);
+                          const QString &model, const QString &problem,
+                          const QString &transport);
     void snapshotSaved(int row, const QString &path);
     void snapshotFailed(int row, const QString &error);
     void recordingsFound(int row, const QVariantList &segments);
@@ -289,6 +295,8 @@ private:
         QSize mainSize;                             // GetEnc-declared main resolution
         QSize subSize;                              // GetEnc-declared sub resolution
         QString uid;                                // per-camera UID (Baichuan playback)
+        int bcPort = 9000;    // Baichuan ("media") port — user-configurable on the device
+        int rtspPort = 554;   // RTSP port — likewise (e.g. shifted for port forwarding)
         QString password;                           // in-memory only (keyring at rest)
         bool primed = false;                        // password loaded?
         api::ChannelCaps caps;                      // this channel's capabilities
@@ -332,6 +340,8 @@ private:
         QString password;
         api::BatteryInfo battery;
         std::shared_ptr<ReolinkHttpClient> client;
+        int bcPort = 9000;   // from GetNetPort (HTTP) or the stored port (Baichuan-only)
+        int rtspPort = 554;
         QVector<ChannelResult> channels; // one per camera to show
     };
 
@@ -348,6 +358,8 @@ private:
     void applyValidation(qint64 hostId, const Validation &v);
     void postValidation(qint64 hostId, const Validation &v); // marshals to GUI thread
     std::shared_ptr<ReolinkHttpClient> clientFor(int row);
+    // Pan/tilt over Baichuan (cmd 18) for devices without HTTP; see the .cpp.
+    void bcPtz(int row, const QString &command, int speed);
 
     Database *m_db;
     CredentialStore *m_credentials;

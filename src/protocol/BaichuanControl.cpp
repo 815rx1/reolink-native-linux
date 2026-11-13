@@ -2,6 +2,7 @@
 
 #include "protocol/BcCrypto.h"
 
+#include <QDeadlineTimer>
 #include <QTcpSocket>
 #include <QXmlStreamReader>
 #include <QtEndian>
@@ -153,8 +154,36 @@ static bool recvMatch(QTcpSocket *sock, QByteArray &netBuf, quint32 wantCmd, Msg
     return false;
 }
 
+static QByteArray decryptReply(const Msg &m, const QByteArray &key);
+
+bool BaichuanControl::probe(const QString &host, int port, int timeoutMs)
+{
+    QTcpSocket sock;
+    sock.connectToHost(host, static_cast<quint16>(port));
+    if (!sock.waitForConnected(timeoutMs))
+        return false;
+    sock.write(helloMessage());
+    sock.flush();
+    QByteArray buf;
+    Msg m;
+    QDeadlineTimer deadline(timeoutMs * 2);
+    while (!deadline.hasExpired()) {
+        while (parseMessage(buf, m))
+            if (m.cmdId == 1)
+                return bc::xorCrypt(m.body, m.chId).contains("<nonce>");
+        if (!sock.waitForReadyRead(static_cast<int>(qMax<qint64>(1, deadline.remainingTime()))))
+            break;
+        buf.append(sock.readAll());
+        if (buf.size() > 65536)
+            break;
+    }
+    return false;
+}
+
 bool BaichuanControl::open()
 {
+    m_fail = Fail::Transport;
+    m_loginInfo.clear();
     m_sock = std::make_unique<QTcpSocket>();
     m_sock->connectToHost(m_p.host, static_cast<quint16>(m_p.port));
     if (!m_sock->waitForConnected(5000)) {
@@ -199,8 +228,11 @@ bool BaichuanControl::open()
     }
     if (loginReply.status != 200) {
         close();
+        m_fail = Fail::Auth; // close() doesn't touch it; the device said no
         return false;
     }
+    m_fail = Fail::None;
+    m_loginInfo = decryptReply(loginReply, m_aesKey);
     return true;
 }
 

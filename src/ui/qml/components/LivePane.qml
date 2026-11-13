@@ -126,7 +126,7 @@ Rectangle {
         if (want) {
             if (effectiveMain && !bcFallback)
                 key = "bc:" + deviceRow;
-            else if (!effectiveMain && subViaBc)
+            else if (!effectiveMain && (subViaBc || Devices.baichuanOnly(deviceRow)))
                 key = "bcsub:" + deviceRow;
             else
                 key = Devices.liveUrl(deviceRow, effectiveMain);
