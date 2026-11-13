@@ -548,11 +548,13 @@ bool runSession(const std::shared_ptr<Session> &s, bool *streamingOut)
             dec->opaque = nullptr;
             hwPixFmt = AV_PIX_FMT_NONE;
             if (avcodec_open2(dec, codec, nullptr) < 0) {
-                postState(s, State::Error, QStringLiteral("could not open decoder"));
+                postState(s, State::Error,
+                          QStringLiteral("could not open decoder (%1)").arg(QLatin1String(codec->name)));
                 return false;
             }
         } else {
-            postState(s, State::Error, QStringLiteral("could not open decoder"));
+            postState(s, State::Error,
+                      QStringLiteral("could not open decoder (%1)").arg(QLatin1String(codec->name)));
             return false;
         }
     }

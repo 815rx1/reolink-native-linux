@@ -17,6 +17,21 @@ finish-args:
   - --device=dri                     # GPU for hardware decode
   - --talk-name=org.freedesktop.secrets  # keyring for credentials
   - --filesystem=xdg-videos          # snapshots / recordings
+# The runtime's own FFmpeg is a patent-free build: it has no native h264/hevc
+# decoder, only a libopenh264 wrapper whose library isn't present, so every
+# stream failed with "[libopenh264] Unable to create decoder" (issue #5).
+# ffmpeg-full (Flathub) ships the complete libav* and is put ahead of the
+# runtime's copy on the library path. KDE 6.7 is based on freedesktop 23.08,
+# hence the version pin — bump it together with runtime-version.
+add-extensions:
+  org.freedesktop.Platform.ffmpeg-full:
+    directory: lib/ffmpeg
+    version: '23.08'
+    add-ld-path: .
+    autodownload: true
+    autodelete: false
+cleanup-commands:
+  - mkdir -p /app/lib/ffmpeg         # mount point for the ffmpeg-full extension
 modules:
   # The KDE SDK doesn't ship libsecret dev; build it (crypto disabled so it
   # doesn't pull in libgcrypt — the Secret portal handles storage encryption).

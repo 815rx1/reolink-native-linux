@@ -6,6 +6,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the project is pre-1.0, minor versions may still change behaviour.
 
+## [Unreleased]
+
+### Fixed
+
+- **Flatpak: no stream ever loaded** (issue #5). The KDE runtime's FFmpeg is a
+  patent-free build without native H.264/H.265 decoders, so every stream died
+  with "[libopenh264] Unable to create decoder". The Flatpak now pulls in the
+  `org.freedesktop.Platform.ffmpeg-full` extension, which is installed
+  automatically alongside the app. The AppImage and source builds were not
+  affected.
+- The "could not open decoder" error now names the decoder that failed.
+
 ## [0.1.8] — 2026-08-12
 
 ### Fixed
