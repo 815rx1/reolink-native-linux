@@ -228,7 +228,7 @@ Item {
             visible: !page.fullscreen
 
             Repeater {
-                model: [1, 4, 6, 9, 16]
+                model: [1, 4]   // 6/9/16 dropped: one or four cameras is all that is needed
                 Rectangle {
                     required property int modelData
                     width: 34
